@@ -5,180 +5,197 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Numerics;
 using System.Threading;
+using System.IO;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Formatters.Binary;
 
 namespace crsa
 {
     class CRsa
     {
+        //Greatest Common Divisor
         private BigInteger gcd(BigInteger a, BigInteger b)
         {
             if (b == 0) return a;
             return gcd(b, a % b);
         }
 
-        private static int PasswordCrc(string passwd)
+        //Least Common Multiple
+        private BigInteger lcm(BigInteger a, BigInteger b)
+        {
+            return BigInteger.Abs(a * b) / gcd(a, b);
+        }
+
+        //Simple string CRC
+        private int PasswordCrc(string passwd)
         {
             int r = 0;
 
             if (!passwd.Any()) return 0xff;
-            foreach (char c in passwd)
-            {
-                r ^= c;
-            }
+            foreach (char c in passwd) r ^= c;
             return r & 0xff;
         }
 
-        public static BigInteger IntegerSquareRoot(BigInteger value)
+        //Check if *value* is prime, by using parallel threads
+        static bool IsPrime(BigInteger v)
         {
-            if (value > 0)
-            {
-                int bitLength = value.ToByteArray().Length * 8;
-                BigInteger root = BigInteger.One << (bitLength / 2);
-
-                while (!IsSquareRoot(value, root))
-                {
-                    root += value / root;
-                    root /= 2;
-                }
-                return root;
-            }
-            else return 0;
-        }
-
-        private static Boolean IsSquareRoot(BigInteger n, BigInteger root)
-        {
-            BigInteger lowerBound = root * root;
-            BigInteger upperBound = (root + 1) * (root + 1);
-
-            return (n >= lowerBound && n < upperBound);
-        }
-
-        static bool IsPrime(BigInteger value)
-        {
-            if (value < 3) return value == 2;
+            if (v < 1) return false;
             else
             {
-                if (value % 2 == 0) return false;
-                else if (value == 5) return true;
-                else if (value % 5 == 0) return false;
-                else
+                if (v <= 3) return true;
+                else if (v % 2 == 0 || v % 3 == 0) return false;
+                else 
                 {
-                    AutoResetEvent success = new AutoResetEvent(false);
-                    AutoResetEvent failure = new AutoResetEvent(false);
-                    AutoResetEvent onesSucceeded = new AutoResetEvent(false);
-                    AutoResetEvent threesSucceeded = new AutoResetEvent(false);
-                    AutoResetEvent sevensSucceeded = new AutoResetEvent(false);
-                    AutoResetEvent ninesSucceeded = new AutoResetEvent(false);
-                    BigInteger squareRootedValue = IntegerSquareRoot(value);
-                    Thread ones = new Thread(() => {
-                        for (BigInteger i = 11; i <= squareRootedValue; i += 10) if (value % i == 0) failure.Set();
-                        onesSucceeded.Set();
-                    });
+                    BigInteger i = 5;
 
-                    ones.Start();
-
-                    Thread threes = new Thread(() => {
-                        for (BigInteger i = 3; i <= squareRootedValue; i += 10) if (value % i == 0) failure.Set();
-                        threesSucceeded.Set();
-                    });
-
-                    threes.Start();
-
-                    Thread sevens = new Thread(() => {
-                        for (BigInteger i = 7; i <= squareRootedValue; i += 10) if (value % i == 0) failure.Set();
-                        sevensSucceeded.Set();
-                    });
-
-                    sevens.Start();
-
-                    Thread nines = new Thread(() => {
-                        for (BigInteger i = 9; i <= squareRootedValue; i += 10) if (value % i == 0) failure.Set();
-                        ninesSucceeded.Set();
-                    });
-
-                    nines.Start();
-                    Thread successWaiter = new Thread(() => {
-                        AutoResetEvent.WaitAll(new WaitHandle[] { onesSucceeded, threesSucceeded, sevensSucceeded,
-                            ninesSucceeded });
-                        success.Set();
-                    });
-                    successWaiter.Start();
-
-                    int result = AutoResetEvent.WaitAny(new WaitHandle[] { success, failure });
-
-                    try { successWaiter.Abort(); } catch { }
-                    try { ones.Abort(); } catch { }
-                    try { threes.Abort(); } catch { }
-                    try { sevens.Abort(); } catch { }
-                    try { nines.Abort(); } catch { }
-                    if (result == 1) return false;
-                    else return true;
+                    while (i * i <= v)
+                    {
+                        if (v % i == 0 || (v % (i + 2) == 0)) return false;
+                        i += 6;
+                    }
+                    return true;
                 }
             }
         }
 
-        private void NextPrimeNumber(Random rnd, out BigInteger bi)
+        private int NextPrimeNumber(Random rnd, ref BigInteger bi)
         {
             byte[] pBytes = new byte[16];
 
             rnd.NextBytes(pBytes);
             bi = new BigInteger(pBytes);
             if (bi < 2) bi = 2;
-            while (!IsPrime(bi)) bi++; //Find prime
+            while (!IsPrime(bi)) 
+                bi++; //Find prime
+            return bi.ToString().Length;
         }
 
-        public void GenerateKeys(out BigInteger pubKey, out BigInteger privKey, string passwd)
+        private BigInteger GetEncryptionExponent(BigInteger bi)
         {
+            BigInteger e = 2;
+
+            while (e < bi)
+            {
+                if (gcd(e, bi) != 1) e++;
+                else break;
+            }
+            return e;
+        }
+
+        private BigInteger GetDecryptionExponent(BigInteger phi, BigInteger e)
+        {
+            /*Modular multiplicative inverse*/
+            if (phi > 0)
+            {
+                e %= phi;
+                for (BigInteger x = 1; x < phi; x++)
+                    if (e * x % phi == 1)
+                        return x;
+            }
+            return 1;
+        }
+
+        public void GenerateKeys(out BigInteger pubKey, out BigInteger privKey)
+        {
+            BigInteger P = 2;
+            BigInteger Q = 2;
             BigInteger phi;
             BigInteger e;
             BigInteger d;
             BigInteger n;
-            BigInteger k = PasswordCrc(passwd);
-            byte[] pBytes = new byte[16];
             Random rnd = new Random((int) DateTime.Now.Ticks);
-            byte blen;
-            List<byte> bt;
+            int l1;
+            long pMark;
+            MemoryStream s = new MemoryStream();
+            BinaryFormatter b = new BinaryFormatter();
 
-            NextPrimeNumber(rnd, out BigInteger P);
-            NextPrimeNumber(rnd, out BigInteger Q);
-
-            n = P * Q; //Encription/Decription modular
-            phi = (P - 1) * (Q - 1); //Totient
-            //Find public key (e), exponent
-            e = 2;
-            while (e < phi)
-            {
-                if (gcd(e, phi) != 1) e++;
-                else break;
-                if (e > 254) break;
-            }
-            //Find private key (d), exponent
-            d = (k * phi + 1) / e;
-
-            //To encript you need et = (msg ^ e) % 
-            pBytes = n.ToByteArray();
-            bt = new List<byte>(); 
-            blen = (byte)pBytes.Length;
-            bt.Add(blen);
-            bt.Add(1);
-            if (blen < 16) bt.AddRange(Enumerable.Repeat<byte>(0, 16 - blen));
-            bt.AddRange(pBytes);
-            bt.Add((byte)e);
-            pubKey = new BigInteger(bt.ToArray());
-
-            privKey = d;
+            l1 = NextPrimeNumber(rnd, ref P); //Get first prime number
+            for (int i = 0; NextPrimeNumber(rnd, ref Q) == l1 && i < 10000; ) ++i; //Choose a different digits size prime number
+            n = P * Q; //Modulo value
+            phi = lcm(P - 1, Q - 1); //Totient
+            e = GetEncryptionExponent(phi); //Find public key (e), exponent
+            d = GetDecryptionExponent(phi, e); //Find private key (d), exponent
+            /*Create public key byte array*/
+            b.Serialize(s, n);
+            pMark = s.Position; //Save serialized N size
+            b.Serialize(s, e);
+            pubKey = new BigInteger(s.ToArray());
+            s.Position = pMark;
+            b.Serialize(s, d);
+            privKey = new BigInteger(s.ToArray());
         }
 
-        public string Encrypt(string plain, BigInteger pubKey)
+        private byte[] Padding(string plain)
         {
-            string s = "";
-            byte[] ba = pubKey.ToByteArray();
+            byte[] r, fill;
+            Random rnd = new Random((int)DateTime.Now.Ticks);
+            int missing = 8 - plain.Length % 8; //Encryption and decryption is set to 8 bytes number (UINT64)
 
+            if (plain == null || plain.Length == 0) return null;
+            r = Encoding.UTF8.GetBytes(plain);
+            if (missing > 0)
+            {
+                fill = new byte[missing];
+                rnd.NextBytes(fill);
+                fill = fill.Select(b => (byte) (b & 0x1f)).ToArray(); //Limit ramdom array to non printable characters
+                r = r.Concat(fill).ToArray();                     //Thus it'll be easier to separate in decrypted stream
+            }
+            return r;
+        }
+
+        private void GetNED(BigInteger key, out BigInteger n, out BigInteger ed)
+        {
+            MemoryStream s = new MemoryStream(key.ToByteArray());
+            BinaryFormatter b = new BinaryFormatter();
+
+            n = (BigInteger)b.Deserialize(s); //Modulo
+            ed = (BigInteger)b.Deserialize(s); //Exponent
+        }
+
+        public byte[] Encrypt(string plain, BigInteger pubKey)
+        {
+            byte[] r = null, p;
+                        
             if (!plain.Any()) throw new ArgumentException("No data to encode");
             if (pubKey < 2) throw new ArgumentException("Invalid key value");
-            if (ba.Length > 64) throw new ArgumentException("Key is to long");
+            GetNED(pubKey, out BigInteger n, out BigInteger e);
+            p = Padding(plain);
+            if (p != null)
+            {
+                var arr = plain.Select(b => BigInteger.Pow(b, (int)e) % n);
+                MemoryStream ms = new MemoryStream();
+                BinaryFormatter bf = new BinaryFormatter();
 
-            return s;
+                foreach (BigInteger bi in arr) bf.Serialize(ms, bi);
+                r = ms.ToArray();
+            }
+            return r;
+        }
+
+        public string Decrypt(byte[] encd, BigInteger privKey)
+        {
+            byte[] r = null, p;
+
+            if (!encd.Any()) throw new ArgumentException("No data to decode");
+            if (privKey < 2) throw new ArgumentException("Invalid key value");
+            GetNED(privKey, out BigInteger n, out BigInteger d);
+            if (encd != null)
+            {
+                MemoryStream ms = new MemoryStream(encd);
+                BinaryFormatter b = new BinaryFormatter();
+                BigInteger[] encbil = new BigInteger[0];
+
+                while (ms.Position < encd.Length)
+                    encbil.Append((BigInteger)b.Deserialize(ms));
+                if (encbil.Any())
+                {
+                    r = encbil.Select(bi => (byte)(BigInteger.Pow(bi, (int)d) % n)) //Decrypt every big-integer
+                        .Where(bt => bt >= 0x20) //Remove padding
+                        .ToArray(); //Get array
+                    return Encoding.UTF8.GetString(r);
+                }
+            }
+            return null;
         }
     }
 }
